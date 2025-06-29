@@ -2,7 +2,7 @@ import frappe
 from fuzzywuzzy import fuzz
 from sa3ed_app.utils.date_helper import calculate_age
 from geopy.distance import geodesic
-import face_recognition
+import cv2
 import numpy as np
 import requests
 from io import BytesIO
@@ -13,15 +13,15 @@ from sa3ed_app.api.api_endpoint import ApiEndPoint
 
 class AIPersonMatcher:
     def __init__(self):
-        self.name_weight = 0.1
-        self.age_weight = 0.2
-        self.gender_weight = 0.15
-        self.location_weight = 0.05
-        self.face_weight = 0.5
+        self.name_weight = 0.2
+        self.age_weight = 0.3
+        self.gender_weight = 0.25
+        self.location_weight = 0.15
+        self.image_weight = 0.1
         self.similarity_threshold = 0.5
 
-    def get_face_encoding(self, image_url):
-        """Get face encoding from image URL"""
+    def get_image_histogram(self, image_url):
+        """Get color histogram from image URL for basic image similarity"""
         try:
             # Handle both relative and absolute URLs
             if not image_url.startswith(('http://', 'https://')):
@@ -39,36 +39,49 @@ class AIPersonMatcher:
                 response.raise_for_status()
                 img = Image.open(BytesIO(response.content))
 
+            # Convert PIL image to OpenCV format
             img_array = np.array(img)
-
-            face_locations = face_recognition.face_locations(img_array)
-            if not face_locations:
-                return None
-
-            face_encodings = face_recognition.face_encodings(img_array, face_locations)
-            return face_encodings[0] if face_encodings else None
+            img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            
+            # Calculate color histogram (3 channels, 256 bins each)
+            hist_b = cv2.calcHist([img_bgr], [0], None, [256], [0, 256])
+            hist_g = cv2.calcHist([img_bgr], [1], None, [256], [0, 256])
+            hist_r = cv2.calcHist([img_bgr], [2], None, [256], [0, 256])
+            
+            # Combine histograms
+            histogram = np.concatenate([hist_b.flatten(), hist_g.flatten(), hist_r.flatten()])
+            
+            # Normalize histogram
+            histogram = histogram / np.sum(histogram)
+            
+            return histogram
         except Exception as e:
             frappe.log_error(f"Error processing image {image_url}: {str(e)}")
             return None
 
-    def calculate_face_similarity(self, lost_person, found_person):
-        """Calculate similarity between face images"""
+    def calculate_image_similarity(self, lost_person, found_person):
+        """Calculate similarity between images using histogram comparison"""
         try:
             if not (lost_person.pic and found_person.pic):
                 return 0
 
-            lost_encoding = self.get_face_encoding(lost_person.pic)
-            found_encoding = self.get_face_encoding(found_person.pic)
+            lost_histogram = self.get_image_histogram(lost_person.pic)
+            found_histogram = self.get_image_histogram(found_person.pic)
 
-            if lost_encoding is None or found_encoding is None:
+            if lost_histogram is None or found_histogram is None:
                 return 0
 
-            face_distance = face_recognition.face_distance([lost_encoding], found_encoding)[0]
-            face_similarity = max(0, 1 - (face_distance / 0.8))
+            # Use correlation method for histogram comparison
+            similarity = cv2.compareHist(lost_histogram.astype(np.float32), 
+                                       found_histogram.astype(np.float32), 
+                                       cv2.HISTCMP_CORREL)
             
-            return face_similarity
+            # Ensure similarity is between 0 and 1
+            similarity = max(0, min(1, similarity))
+            
+            return similarity
         except Exception as e:
-            frappe.log_error(f"Face comparison error: {str(e)}")
+            frappe.log_error(f"Image comparison error: {str(e)}")
             return 0
 
     def calculate_name_similarity(self, lost_person, found_person):
@@ -123,19 +136,19 @@ class AIPersonMatcher:
         age_sim = self.calculate_age_similarity(lost_person, found_person)
         gender_sim = self.calculate_gender_similarity(lost_person, found_person)
         location_sim = self.calculate_location_similarity(lost_person, found_person)
-        face_sim = self.calculate_face_similarity(lost_person, found_person)
+        image_sim = self.calculate_image_similarity(lost_person, found_person)
 
         overall_similarity = (
             name_sim * self.name_weight +
             age_sim * self.age_weight +
             gender_sim * self.gender_weight +
             location_sim * self.location_weight +
-            face_sim * self.face_weight
+            image_sim * self.image_weight
         )
         
-        return [overall_similarity, face_sim, gender_sim, age_sim]
+        return [overall_similarity, image_sim, gender_sim, age_sim]
 
-    def create_people_match_record(self, lost_person_id, found_person_id, similarity_score, face_sim, gender_sim, age_sim):
+    def create_people_match_record(self, lost_person_id, found_person_id, similarity_score, image_sim, gender_sim, age_sim):
         """Create a record in People Match doctype"""
         try:
             existing_match = frappe.get_all(
@@ -149,7 +162,7 @@ class AIPersonMatcher:
             if existing_match:
                 match_doc = frappe.get_doc("People Match", existing_match[0].name)
                 match_doc.similarity_score = similarity_score
-                match_doc.face_similarity = face_sim
+                match_doc.face_similarity = image_sim
                 match_doc.gender_similarity = gender_sim
                 match_doc.age_similarity = age_sim
                 match_doc.save()
@@ -160,7 +173,7 @@ class AIPersonMatcher:
                     "lost_person": lost_person_id,
                     "found_person": found_person_id,
                     "similarity_score": similarity_score,
-                    "face_similarity": face_sim,
+                    "face_similarity": image_sim,
                     "gender_similarity": gender_sim,
                     "age_similarity": age_sim,
                     "match_status": "Pending",
